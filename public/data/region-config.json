@@ -1,6 +1,6 @@
 {
   "110000": {
-    "color": "#adb2df",
+    "color": "#a78bfa",
     "display": "label",
     "headcount": 2,
     "positions": [
@@ -71,7 +71,7 @@
     ]
   },
   "110114": {
-    "color": "#8b90c2",
+    "color": "#fbbf24",
     "display": "label",
     "headcount": 1,
     "roster": [
@@ -85,19 +85,16 @@
     ]
   },
   "150000": {
-    "color": "#cfd3fc",
+    "color": "#e879f9",
     "display": "label",
-    "headcount": 2,
-    "roster": []
+    "headcount": 2
   },
   "632200": {
-    "color": "#696fa5",
-    "display": "label",
-    "roster": []
+    "color": "#fb923c",
+    "display": "label"
   },
   "632700": {
-    "color": "#474d88",
-    "display": "label",
-    "roster": []
+    "color": "#34d399",
+    "display": "label"
   }
 }

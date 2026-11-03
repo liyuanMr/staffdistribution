@@ -183,15 +183,63 @@ function polygonsOf(feature) {
   return g.type === 'Polygon' ? [g.coordinates] : g.coordinates
 }
 
-function featureToPathD(feature) {
+// Ramer–Douglas–Peucker：按容差精简折线 / 多边形环，显著减少 SVG 节点数
+function simplifyPoints(points, tolerance) {
+  const n = points.length
+  if (n <= 4 || tolerance <= 0) return points
+  const keep = new Uint8Array(n)
+  keep[0] = 1
+  keep[n - 1] = 1
+  const stack = [[0, n - 1]]
+  const tol2 = tolerance * tolerance
+  while (stack.length) {
+    const [start, end] = stack.pop()
+    const [x1, y1] = points[start]
+    const [x2, y2] = points[end]
+    const dx = x2 - x1
+    const dy = y2 - y1
+    const len2 = dx * dx + dy * dy
+    let maxD2 = 0
+    let idx = -1
+    for (let i = start + 1; i < end; i++) {
+      const [x, y] = points[i]
+      let d2
+      if (len2 === 0) {
+        d2 = (x - x1) * (x - x1) + (y - y1) * (y - y1)
+      } else {
+        const t = ((x - x1) * dx + (y - y1) * dy) / len2
+        const px = x1 + t * dx
+        const py = y1 + t * dy
+        d2 = (x - px) * (x - px) + (y - py) * (y - py)
+      }
+      if (d2 > maxD2) {
+        maxD2 = d2
+        idx = i
+      }
+    }
+    if (maxD2 > tol2 && idx > 0) {
+      keep[idx] = 1
+      stack.push([start, idx], [idx, end])
+    }
+  }
+  const out = []
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i])
+  return out
+}
+
+function featureToPathD(feature, tolerance = 0, decimals = 2) {
   let d = ''
   for (const poly of polygonsOf(feature)) {
     for (const ring of poly) {
       if (ring.length < 3) continue
-      d += 'M' + ring.map(([lng, lat]) => {
+      let pts = []
+      for (const [lng, lat] of ring) {
         const p = projection([lng, lat])
-        return p[0].toFixed(2) + ',' + p[1].toFixed(2)
-      }).join('L') + 'Z'
+        if (p && Number.isFinite(p[0]) && Number.isFinite(p[1])) pts.push(p)
+      }
+      if (tolerance > 0 && pts.length > 4) pts = simplifyPoints(pts, tolerance)
+      if (pts.length < 3) continue
+      d += 'M' + pts.map((p) => p[0].toFixed(decimals) + ',' + p[1].toFixed(decimals)).join('L') + 'Z'
     }
   }
   return d
@@ -500,8 +548,185 @@ function fitCanvasText(ctx, value, maxW) {
   return out + '…'
 }
 
-// 按当前视图导出 2 倍分辨率 PNG，可直接插入 PPT
-function exportImage(scale = 2) {
+const FONT_FAMILY = "Consolas, 'Microsoft YaHei', 'PingFang SC', monospace"
+const NAME_H = 14
+const BADGE_H = 15
+const BADGE_GAP = 3
+
+// Canvas 与 SVG 共用同一套文本测量，保证两种导出的换行 / 省略一致
+let measureCtx = null
+function getMeasureCtx() {
+  if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d')
+  return measureCtx
+}
+
+function num(v) {
+  return Math.round(v * 100) / 100
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+}
+
+// SVG 1.1 对 rgba() 支持不稳，拆成 rgb + fill-opacity（PPT 更可靠）
+function svgColorParts(css) {
+  const m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/.exec(
+    String(css)
+  )
+  if (!m) return { color: css, opacity: 1 }
+  return {
+    color: `rgb(${Math.round(+m[1])}, ${Math.round(+m[2])}, ${Math.round(+m[3])})`,
+    opacity: m[4] == null ? 1 : +m[4]
+  }
+}
+
+// 单条 SVG 文本。只使用纯 fill，不加描边：
+// PowerPoint 不支持 paint-order，描边会盖在文字上导致颜色被冲掉（尤其是浅色主题下发白）。
+function svgText(opts, fill) {
+  const { text, x, centerY, fontSize, weight = 400, anchor = 'middle' } = opts
+  // PPT 对 dominant-baseline 支持有限，按 0.35em 把垂直中心换算成基线
+  const y = centerY + fontSize * 0.35
+  const base =
+    `x="${num(x)}" y="${num(y)}" font-family="${FONT_FAMILY}" font-size="${fontSize}" ` +
+    `font-weight="${weight}" text-anchor="${anchor}"`
+  // 同时写 fill 属性和 style：不同版本的 PPT / Office 解析 SVG 时兼容性更好
+  return `<text ${base} fill="${fill}" style="fill:${fill};stroke:none">${escapeXml(text)}</text>`
+}
+
+// 标签布局：屏幕坐标下的名称 + 各条数值（Canvas / SVG 共用）
+function computeLabelLayout(r) {
+  // 正在展示气泡的区域由气泡自己显示名称，避免底层标签隔着一层半透明背景透出来
+  const shownBubble = bubbleRegion.value
+  if (shownBubble && shownBubble.adcode === r.adcode) return []
+  const k = zoomState.k
+  const lx = r.cx * k + zoomState.x
+  const ly = r.cy * k + zoomState.y
+  const valueList = r.displayMode === 'bubble' ? [] : r.values
+  const showName = labelNameVisible.value
+  const valuesH = valueList.length * BADGE_H + Math.max(valueList.length - 1, 0) * BADGE_GAP
+  const totalH = (showName ? NAME_H : 0) + (valueList.length ? (showName ? 2 : 0) + valuesH : 0)
+  const y = ly - totalH / 2
+  const items = []
+  if (showName) {
+    items.push({ text: r.name, x: lx, centerY: y + NAME_H / 2, fontSize: 12, weight: 400 })
+  }
+  let by = y + (showName ? NAME_H + 2 : 0)
+  for (const v of valueList) {
+    items.push({ text: v, x: lx, centerY: by + BADGE_H / 2 + 0.5, fontSize: 11, weight: 600 })
+    by += BADGE_H + BADGE_GAP
+  }
+  return items
+}
+
+// 气泡布局：与页面 / Canvas 完全一致的尺寸和位置，供 Canvas 与 SVG 共用
+function computeBubbleLayout(br, lx, ly, cw, ch) {
+  const ctx = getMeasureCtx()
+  const padX = 12
+  const padY = 10
+  const titleH = 18
+  const rowH = 16
+  const cellH = rowH + 4
+  const cellGapY = 2
+  const colGap = 8
+  const colW = 112
+  const titleFont = `600 12px ${FONT_FAMILY}`
+  const rowFont = `600 11px ${FONT_FAMILY}`
+  const rosterText = br.bubbleRosterNames.length ? `人员：${br.bubbleRosterNames.join('、')}` : ''
+  const headcountText = br.bubbleHeadcount != null ? `人数：${br.bubbleHeadcount}` : ''
+
+  // 气泡宽度随内容自适应：取标题、人数、岗位网格、人员行里最宽的一项
+  ctx.font = titleFont
+  let desiredW = ctx.measureText(br.name).width + 52
+  ctx.font = rowFont
+  if (headcountText) desiredW = Math.max(desiredW, ctx.measureText(headcountText).width + padX * 2)
+  if (br.bubblePositions.length) desiredW = Math.max(desiredW, colW * 2 + colGap + padX * 2)
+  if (rosterText) desiredW = Math.max(desiredW, ctx.measureText(rosterText).width + padX * 2)
+  const boxW = Math.min(Math.max(desiredW, 140), Math.max(Math.min(360, cw - 8), 140))
+
+  ctx.font = rowFont
+  const rosterLines = rosterText ? wrapCanvasText(ctx, rosterText, boxW - padX * 2) : []
+  const posRows = Math.ceil(br.bubblePositions.length / 2)
+
+  let boxH = padY * 2 + titleH
+  if (br.bubbleHeadcount != null) boxH += 4 + rowH
+  if (br.bubblePositions.length) {
+    boxH += 4 + rowH + 3 + posRows * cellH + Math.max(posRows - 1, 0) * cellGapY
+  }
+  if (rosterLines.length) boxH += 4 + rosterLines.length * rowH
+
+  const bx = Math.min(Math.max(lx - boxW / 2, 4), Math.max(cw - boxW - 4, 4))
+  const byTop = Math.min(Math.max(ly - boxH / 2, 4), Math.max(ch - boxH - 4, 4))
+
+  let cursor = byTop + padY + titleH
+  const headcount =
+    br.bubbleHeadcount != null
+      ? { text: headcountText, x: bx + padX, centerY: cursor + 4 + rowH / 2 }
+      : null
+  if (headcount) cursor += 4 + rowH
+
+  let heading = null
+  const cells = []
+  if (br.bubblePositions.length) {
+    cursor += 4
+    heading = { text: '岗位', x: bx + padX, centerY: cursor + rowH / 2 }
+    cursor += rowH + 3
+    br.bubblePositions.forEach((p, i) => {
+      const col = i % 2
+      const row = Math.floor(i / 2)
+      const cellX = bx + padX + col * (colW + colGap)
+      const cellY = cursor + row * (cellH + cellGapY)
+      const countText = p.count == null ? '' : `${p.count}人`
+      ctx.font = rowFont
+      const countW = countText ? ctx.measureText(countText).width : 0
+      cells.push({
+        x: cellX,
+        y: cellY,
+        w: colW,
+        h: cellH,
+        name: fitCanvasText(ctx, p.name || '未命名', colW - 12 - countW - 6),
+        count: countText,
+        nameX: cellX + 6,
+        countX: cellX + colW - 6,
+        centerY: cellY + cellH / 2
+      })
+    })
+    cursor += posRows * cellH + Math.max(posRows - 1, 0) * cellGapY
+  }
+
+  let roster = null
+  if (rosterLines.length) {
+    cursor += 4
+    roster = {
+      x: bx + padX,
+      lines: rosterLines,
+      firstCenterY: cursor + rowH / 2,
+      lineH: rowH
+    }
+  }
+
+  return {
+    bx,
+    byTop,
+    boxW,
+    boxH,
+    titleX: bx + boxW / 2,
+    titleCenterY: byTop + padY + titleH / 2,
+    titleFont,
+    rowFont,
+    headcount,
+    heading,
+    cells,
+    roster
+  }
+}
+
+// 按当前视图绘制到离屏 Canvas（PNG 导出与剪贴板共用）
+function renderCanvas(scale = 2) {
   const cw = container.value ? container.value.clientWidth : 0
   const ch = container.value ? container.value.clientHeight : 0
   if (!cw || !ch) return false
@@ -546,88 +771,33 @@ function exportImage(scale = 2) {
   ctx.restore()
 
   // 标签：与页面上的位置一致
-  const fontFamily = "Consolas, 'Microsoft YaHei', 'PingFang SC', monospace"
-  const nameH = 14
-  const badgeH = 15
-  const badgeGap = 3
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
   for (const r of shownRegions.value) {
-    const lx = r.cx * k + zoomState.x
-    const ly = r.cy * k + zoomState.y
-    const valueList = r.displayMode === 'bubble' ? [] : r.values
-    const showName = labelNameVisible.value
-    const valuesH = valueList.length * badgeH + Math.max(valueList.length - 1, 0) * badgeGap
-    const totalH = (showName ? nameH : 0) + (valueList.length ? (showName ? 2 : 0) + valuesH : 0)
-    const y = ly - totalH / 2
-
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    if (showName) {
-      ctx.font = `12px ${fontFamily}`
+    for (const it of computeLabelLayout(r)) {
+      ctx.font = `${it.weight} ${it.fontSize}px ${FONT_FAMILY}`
       // 与页面一致：所有标签统一用主题文字色，加背景色描边保证可读
       ctx.fillStyle = theme.value.bubbleText
       ctx.shadowColor = theme.value.bg1
       ctx.shadowBlur = 3
-      ctx.fillText(r.name, lx, y + nameH / 2)
+      ctx.fillText(it.text, it.x, it.centerY)
       ctx.shadowBlur = 0
       ctx.shadowColor = 'transparent'
-    }
-
-    let by = y + (showName ? nameH + 2 : 0)
-    ctx.font = `600 11px ${fontFamily}`
-    for (const v of valueList) {
-      // 与页面一致：不加背景色，用主题文字色 + 背景色描边保证可读
-      ctx.fillStyle = theme.value.bubbleText
-      ctx.shadowColor = theme.value.bg1
-      ctx.shadowBlur = 3
-      ctx.fillText(v, lx, by + badgeH / 2 + 0.5)
-      ctx.shadowBlur = 0
-      ctx.shadowColor = 'transparent'
-      by += badgeH + badgeGap
     }
   }
 
   // 气泡方式：导出当前显示的气泡（居中于区域重心，岗位两列排布）
   const br = bubbleRegion.value
   if (br) {
-    const lx = br.cx * k + zoomState.x
-    const ly = br.cy * k + zoomState.y
-    const padX = 12
-    const padY = 10
-    const titleH = 18
-    const rowH = 16
-    const cellH = rowH + 4
-    const cellGapY = 2
-    const colGap = 8
-    // 岗位固定窄列宽（与页面 CSS 一致），超长名称省略号截断
-    const colW = 112
-    const titleFont = `600 12px ${fontFamily}`
-    const rowFont = `600 11px ${fontFamily}`
-    const rosterText = br.bubbleRosterNames.length ? `人员：${br.bubbleRosterNames.join('、')}` : ''
-    const headcountText = br.bubbleHeadcount != null ? `人数：${br.bubbleHeadcount}` : ''
+    const L = computeBubbleLayout(
+      br,
+      br.cx * k + zoomState.x,
+      br.cy * k + zoomState.y,
+      cw,
+      ch
+    )
 
-    // 气泡宽度随内容自适应：取标题、人数、岗位网格、人员行里最宽的一项
-    ctx.font = titleFont
-    let desiredW = ctx.measureText(br.name).width + 52
-    ctx.font = rowFont
-    if (headcountText) desiredW = Math.max(desiredW, ctx.measureText(headcountText).width + padX * 2)
-    if (br.bubblePositions.length) desiredW = Math.max(desiredW, colW * 2 + colGap + padX * 2)
-    if (rosterText) desiredW = Math.max(desiredW, ctx.measureText(rosterText).width + padX * 2)
-    const boxW = Math.min(Math.max(desiredW, 140), Math.max(Math.min(360, cw - 8), 140))
-
-    const rosterLines = rosterText ? wrapCanvasText(ctx, rosterText, boxW - padX * 2) : []
-    const posRows = Math.ceil(br.bubblePositions.length / 2)
-
-    let boxH = padY * 2 + titleH
-    if (br.bubbleHeadcount != null) boxH += 4 + rowH
-    if (br.bubblePositions.length) {
-      boxH += 4 + rowH + 3 + posRows * cellH + Math.max(posRows - 1, 0) * cellGapY
-    }
-    if (rosterLines.length) boxH += 4 + rosterLines.length * rowH
-
-    const bx = Math.min(Math.max(lx - boxW / 2, 4), Math.max(cw - boxW - 4, 4))
-    const byTop = Math.min(Math.max(ly - boxH / 2, 4), Math.max(ch - boxH - 4, 4))
-
-    roundRectPath(ctx, bx, byTop, boxW, boxH, 8)
+    roundRectPath(ctx, L.bx, L.byTop, L.boxW, L.boxH, 8)
     ctx.fillStyle = theme.value.bubbleBg
     ctx.fill()
     ctx.strokeStyle = br.accent
@@ -635,76 +805,446 @@ function exportImage(scale = 2) {
     ctx.stroke()
 
     ctx.textBaseline = 'middle'
-    ctx.font = titleFont
+    ctx.font = L.titleFont
     ctx.fillStyle = br.accent
     ctx.textAlign = 'center'
-    ctx.fillText(br.name, bx + boxW / 2, byTop + padY + titleH / 2)
+    ctx.fillText(br.name, L.titleX, L.titleCenterY)
 
-    ctx.font = rowFont
+    ctx.font = L.rowFont
     ctx.fillStyle = theme.value.bubbleText
     ctx.textAlign = 'left'
-    let cursor = byTop + padY + titleH
 
-    if (br.bubbleHeadcount != null) {
-      cursor += 4
-      ctx.fillText(`人数：${br.bubbleHeadcount}`, bx + padX, cursor + rowH / 2)
-      cursor += rowH
+    if (L.headcount) {
+      ctx.fillText(L.headcount.text, L.headcount.x, L.headcount.centerY)
+    }
+    if (L.heading) {
+      ctx.fillText(L.heading.text, L.heading.x, L.heading.centerY)
     }
 
-    if (br.bubblePositions.length) {
-      cursor += 4
-      ctx.fillText('岗位', bx + padX, cursor + rowH / 2)
-      cursor += rowH + 3
-      br.bubblePositions.forEach((p, i) => {
-        const col = i % 2
-        const row = Math.floor(i / 2)
-        const cellX = bx + padX + col * (colW + colGap)
-        const cellY = cursor + row * (cellH + cellGapY)
-        roundRectPath(ctx, cellX, cellY, colW, cellH, 3)
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.05)'
-        ctx.fill()
-        const countText = p.count == null ? '' : `${p.count}人`
-        ctx.font = rowFont
-        const countW = countText ? ctx.measureText(countText).width : 0
-        ctx.fillStyle = theme.value.bubbleText
-        ctx.fillText(
-          fitCanvasText(ctx, p.name || '未命名', colW - 12 - countW - 6),
-          cellX + 6,
-          cellY + cellH / 2
-        )
-        if (countText) {
-          ctx.fillStyle = br.accent
-          ctx.textAlign = 'right'
-          ctx.fillText(countText, cellX + colW - 6, cellY + cellH / 2)
-          ctx.textAlign = 'left'
-        }
-      })
-      cursor += posRows * cellH + Math.max(posRows - 1, 0) * cellGapY
+    for (const cell of L.cells) {
+      roundRectPath(ctx, cell.x, cell.y, cell.w, cell.h, 3)
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.05)'
+      ctx.fill()
+      ctx.fillStyle = theme.value.bubbleText
+      ctx.fillText(cell.name, cell.nameX, cell.centerY)
+      if (cell.count) {
+        ctx.fillStyle = br.accent
+        ctx.textAlign = 'right'
+        ctx.fillText(cell.count, cell.countX, cell.centerY)
+        ctx.textAlign = 'left'
+      }
     }
 
-    if (rosterLines.length) {
-      cursor += 4
-      rosterLines.forEach((line, i) => {
-        ctx.fillText(line, bx + padX, cursor + rowH / 2 + i * rowH)
+    if (L.roster) {
+      L.roster.lines.forEach((line, i) => {
+        ctx.fillText(line, L.roster.x, L.roster.firstCenterY + i * L.roster.lineH)
       })
     }
   }
 
+  return canvas
+}
+
+function timestamp() {
   const d = new Date()
-  const pad = (n) => String(n).padStart(2, '0')
-  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`
+  const pad = (v) => String(v).padStart(2, '0')
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`
+}
+
+function download(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// 导出选项默认值（SVG 设置面板会覆盖这些值）
+const EXPORT_SIMPLIFY_TOLERANCE = { none: 0, light: 0.45, standard: 1.0, strong: 2.0 }
+const DEFAULT_EXPORT_OPTIONS = {
+  adcodes: null, // null = 当前视图全部；数组 = 只导出这些区域
+  includeContext: true, // 未导出的区域保留浅色轮廓
+  extrude: false, // 立体色块
+  depth: 8, // 立体厚度（导出图像像素）
+  simplify: 'standard', // none / light / standard / strong
+  background: true,
+  labels: true, // 标签 + 当前气泡
+  labelColor: '', // 标注 / 气泡正文颜色；空 = 跟随主题
+  merge: true // 未标注区域合并成一个形状，显著减少 PPT 形状数
+}
+
+function isAnnotated(code) {
+  const cfg = props.config[code]
+  if (!cfg) return false
+  return !!(
+    cfg.color ||
+    cfg.headcount != null ||
+    (cfg.positions && cfg.positions.length) ||
+    (cfg.roster && cfg.roster.length)
+  )
+}
+
+// 供导出面板列出的当前视图区域
+function getExportRegions() {
+  return shownRegions.value.map((r) => ({
+    adcode: r.adcode,
+    name: r.name,
+    color: r.configured ? r.accent : '',
+    annotated: isAnnotated(r.adcode)
+  }))
+}
+
+// 把颜色变暗，用于立体色块的侧面 / 底面
+function shadeHex(color, factor) {
+  let hex = String(color || '').replace('#', '')
+  if (/^[0-9a-fA-F]{3}$/.test(hex)) {
+    hex = hex
+      .split('')
+      .map((c) => c + c)
+      .join('')
+  }
+  if (!/^[0-9a-fA-F]{6}$/.test(hex)) return color
+  const n = parseInt(hex, 16)
+  const r = Math.round(((n >> 16) & 255) * factor)
+  const g = Math.round(((n >> 8) & 255) * factor)
+  const b = Math.round((n & 255) * factor)
+  return (
+    '#' +
+    [r, g, b]
+      .map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0'))
+      .join('')
+  )
+}
+
+function countPathPoints(d) {
+  const m = String(d).match(/-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?/g)
+  return m ? m.length : 0
+}
+
+// 生成与当前视图一致的 SVG（矢量，插入 PPT 后可无损缩放）
+// 返回 { svg, regions, shapes, texts, points, bytes }，便于界面提示导出体积
+function buildSVG(options = {}) {
+  const opts = { ...DEFAULT_EXPORT_OPTIONS, ...options }
+  const cw = container.value ? container.value.clientWidth : 0
+  const ch = container.value ? container.value.clientHeight : 0
+  if (!cw || !ch) return null
+
+  const k = zoomState.k
+  const t = theme.value
+  const selKey = props.selectedAdcode != null ? String(props.selectedAdcode) : ''
+  const all = shownRegions.value
+
+  // 范围：只导出勾选的区域；未勾选的按需作为浅色上下文保留
+  const filter = Array.isArray(opts.adcodes) ? new Set(opts.adcodes.map(String)) : null
+  const chosen = filter ? all.filter((r) => filter.has(r.adcode)) : all.slice()
+  if (!chosen.length) return null
+  const chosenSet = new Set(chosen.map((r) => r.adcode))
+  const context = opts.includeContext ? all.filter((r) => !chosenSet.has(r.adcode)) : []
+
+  // 简化容差按「最终图像像素」定义，再除以缩放比例换算到地图坐标
+  const tolPx = EXPORT_SIMPLIFY_TOLERANCE[opts.simplify] || 0
+  const tol = tolPx / k
+  const ctxTol = tol * 1.5
+  const decimals = opts.simplify === 'none' ? 2 : 1
+  const featureByCode = new Map(currentFeatures.map((f) => [String(f.properties.adcode), f]))
+  const pathCache = new Map()
+  let points = 0
+
+  function pathOf(r, tolerance) {
+    if (!tolerance) return r.d
+    const key = r.adcode + '|' + tolerance
+    if (pathCache.has(key)) return pathCache.get(key)
+    const f = featureByCode.get(r.adcode)
+    const d = f ? featureToPathD(f, tolerance, decimals) : r.d
+    pathCache.set(key, d)
+    return d
+  }
+
+  const mergedPlain = opts.merge
+    ? chosen.filter((r) => !isAnnotated(r.adcode) && r.adcode !== selKey)
+    : []
+  const individual = opts.merge
+    ? chosen.filter((r) => isAnnotated(r.adcode) || r.adcode === selKey)
+    : chosen
+
+  const baseFill = t.regionFill
+  const baseStroke = t.regionStroke
+  const labelFill = opts.labelColor || t.bubbleText
+  const depthWorld = opts.extrude ? Math.max(0, Math.min(40, Number(opts.depth) || 0)) / k : 0
+  const fillOf = (r) => (isAnnotated(r.adcode) ? r.accent : baseFill)
+
+  let baseD = ''
+  for (const r of mergedPlain) baseD += pathOf(r, tol)
+
+  const out = []
+  out.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${cw}" height="${ch}" viewBox="0 0 ${cw} ${ch}">`
+  )
+  if (opts.background) {
+    out.push(
+      '<defs><linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">' +
+        `<stop offset="0" stop-color="${t.bg1}"/>` +
+        `<stop offset="1" stop-color="${t.bg2}"/>` +
+        '</linearGradient></defs>'
+    )
+    out.push(`<rect width="${cw}" height="${ch}" fill="url(#bgGrad)"/>`)
+  }
+
+  out.push(`<g transform="translate(${num(zoomState.x)},${num(zoomState.y)}) scale(${num(k)})">`)
+
+  // 上下文：省轮廓 + 未导出的区域，统一浅色，合并成一个形状
+  if (opts.includeContext && contextPath.value) {
+    out.push(
+      `<path d="${contextPath.value}" fill="${t.contextFill}" fill-opacity="0.22" stroke="${t.regionStroke}" stroke-opacity="0.35" stroke-width="${num(1 / k)}" fill-rule="evenodd"/>`
+    )
+    points += countPathPoints(contextPath.value)
+  }
+  if (context.length) {
+    let ctxD = ''
+    for (const r of context) ctxD += pathOf(r, ctxTol)
+    if (ctxD) {
+      out.push(
+        `<path d="${ctxD}" fill="${t.contextFill}" fill-opacity="0.25" stroke="${t.regionStroke}" stroke-opacity="0.4" stroke-width="${num(0.5 / k)}" fill-rule="evenodd"/>`
+      )
+      points += countPathPoints(ctxD)
+    }
+  }
+
+  // 立体：先画所有底面，再画所有顶面，避免相邻区域的侧面盖住顶面
+  if (opts.extrude) {
+    if (baseD) {
+      out.push(
+        `<path d="${baseD}" fill="${shadeHex(baseFill, 0.55)}" stroke="${shadeHex(baseFill, 0.45)}" stroke-width="${num(0.4 / k)}" transform="translate(0,${num(depthWorld)})" fill-rule="evenodd" stroke-linejoin="round"/>`
+      )
+      points += countPathPoints(baseD)
+    }
+    for (const r of individual) {
+      const d = pathOf(r, tol)
+      const fill = fillOf(r)
+      out.push(
+        `<path d="${d}" fill="${shadeHex(fill, 0.55)}" stroke="${shadeHex(fill, 0.45)}" stroke-width="${num(0.4 / k)}" transform="translate(0,${num(depthWorld)})" fill-rule="evenodd" stroke-linejoin="round"/>`
+      )
+      points += countPathPoints(d)
+    }
+  }
+
+  // 顶面：合并后的未标注区域
+  if (baseD) {
+    out.push(
+      `<path d="${baseD}" fill="${baseFill}" stroke="${baseStroke}" stroke-width="${num(0.5 / k)}" fill-rule="evenodd" stroke-linejoin="round"/>`
+    )
+    points += countPathPoints(baseD)
+  }
+
+  // 顶面：有标注区域 + 选中区域，逐个导出
+  for (const r of individual) {
+    const d = pathOf(r, tol)
+    const selected = r.adcode === selKey
+    out.push(
+      `<path d="${d}" fill="${fillOf(r)}" stroke="${selected ? t.selectedStroke : t.regionStroke}" stroke-width="${num((selected ? 1.2 : 0.5) / k)}" fill-rule="evenodd" stroke-linejoin="round"/>`
+    )
+    points += countPathPoints(d)
+  }
+
+  out.push('</g>')
+
+  let textCount = 0
+  if (opts.labels) {
+    // 标签：只为导出的区域生成；文字保持可编辑
+    for (const r of chosen) {
+      for (const it of computeLabelLayout(r)) {
+        out.push(svgText(it, labelFill))
+        textCount++
+      }
+    }
+
+    // 气泡：当前选中且设置为气泡展示的区域
+    const br = bubbleRegion.value
+    if (br && chosenSet.has(br.adcode)) {
+      const L = computeBubbleLayout(
+        br,
+        br.cx * k + zoomState.x,
+        br.cy * k + zoomState.y,
+        cw,
+        ch
+      )
+      const bg = svgColorParts(t.bubbleBg)
+      out.push(
+        `<rect x="${num(L.bx)}" y="${num(L.byTop)}" width="${num(L.boxW)}" height="${num(L.boxH)}" ` +
+          `rx="8" fill="${bg.color}" fill-opacity="${bg.opacity}" stroke="${br.accent}" stroke-width="1"/>`
+      )
+      out.push(
+        svgText(
+          { text: br.name, x: L.titleX, centerY: L.titleCenterY, fontSize: 12, weight: 600 },
+          br.accent
+        )
+      )
+      textCount++
+      if (L.headcount) {
+        out.push(svgText({ ...L.headcount, fontSize: 11, weight: 600 }, labelFill))
+        textCount++
+      }
+      if (L.heading) {
+        out.push(svgText({ ...L.heading, fontSize: 11, weight: 600 }, labelFill))
+        textCount++
+      }
+      for (const cell of L.cells) {
+        out.push(
+          `<rect x="${num(cell.x)}" y="${num(cell.y)}" width="${num(cell.w)}" height="${num(cell.h)}" rx="3" fill="#ffffff" fill-opacity="0.05"/>`
+        )
+        out.push(
+          svgText(
+            {
+              text: cell.name,
+              x: cell.nameX,
+              centerY: cell.centerY,
+              fontSize: 11,
+              weight: 600,
+              anchor: 'start'
+            },
+            labelFill
+          )
+        )
+        textCount++
+        if (cell.count) {
+          out.push(
+            svgText(
+              {
+                text: cell.count,
+                x: cell.countX,
+                centerY: cell.centerY,
+                fontSize: 11,
+                weight: 600,
+                anchor: 'end'
+              },
+              br.accent
+            )
+          )
+          textCount++
+        }
+      }
+      if (L.roster) {
+        L.roster.lines.forEach((line, i) => {
+          out.push(
+            svgText(
+              {
+                text: line,
+                x: L.roster.x,
+                centerY: L.roster.firstCenterY + i * L.roster.lineH,
+                fontSize: 11,
+                weight: 600,
+                anchor: 'start'
+              },
+              labelFill
+            )
+          )
+          textCount++
+        })
+      }
+    }
+  }
+
+  out.push('</svg>')
+  const svg = out.join('')
+  return {
+    svg,
+    regions: chosen.length,
+    shapes: (svg.match(/<path /g) || []).length + (svg.match(/<rect /g) || []).length,
+    texts: textCount,
+    points,
+    bytes: new Blob([svg]).size
+  }
+}
+
+// 按当前视图导出 2 倍分辨率 PNG，可直接插入 PPT
+function exportImage(scale = 2) {
+  const canvas = renderCanvas(scale)
+  if (!canvas) return false
   canvas.toBlob((blob) => {
-    if (!blob) return
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `区域标注分布-${stamp}.png`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    if (blob) download(blob, `区域标注分布-${timestamp()}.png`)
   }, 'image/png')
   return true
+}
+
+// 导出 SVG 文件：PPT 中「插入 → 图片」选择该文件，即为可缩放的矢量图
+function exportSVG(options = {}) {
+  const built = buildSVG(options)
+  if (!built) return false
+  download(
+    new Blob([built.svg], { type: 'image/svg+xml;charset=utf-8' }),
+    `区域标注分布-${timestamp()}.svg`
+  )
+  return {
+    regions: built.regions,
+    shapes: built.shapes,
+    texts: built.texts,
+    points: built.points,
+    bytes: built.bytes
+  }
+}
+
+// 把 SVG 栅格化成 PNG，用作剪贴板兜底（与导出的 SVG 完全一致）
+async function svgToPngBlob(svg, scale = 2) {
+  const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }))
+  try {
+    const img = new Image()
+    img.src = url
+    await new Promise((resolve, reject) => {
+      img.onload = resolve
+      img.onerror = () => reject(new Error('SVG 转图片失败'))
+    })
+    const w = img.naturalWidth
+    const h = img.naturalHeight
+    if (!w || !h) return null
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(w * scale)
+    canvas.height = Math.round(h * scale)
+    const ctx = canvas.getContext('2d')
+    ctx.scale(scale, scale)
+    ctx.drawImage(img, 0, 0, w, h)
+    return await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'))
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
+// 复制当前视图：优先写入 SVG（PPT 中保持矢量），同时带 PNG 兜底
+async function copyToClipboard(options = {}) {
+  if (!container.value) return false
+  const ClipboardItemCtor = window.ClipboardItem
+  if (!navigator.clipboard || typeof ClipboardItemCtor === 'undefined') return false
+
+  const built = buildSVG(options)
+  if (!built) return false
+  const svgBlob = new Blob([built.svg], { type: 'image/svg+xml' })
+  const pngBlob = await svgToPngBlob(built.svg, 2)
+  const canSvg =
+    typeof ClipboardItemCtor.supports !== 'function' ||
+    ClipboardItemCtor.supports('image/svg+xml')
+
+  const attempts = []
+  if (canSvg && pngBlob) attempts.push({ 'image/svg+xml': svgBlob, 'image/png': pngBlob })
+  else if (canSvg) attempts.push({ 'image/svg+xml': svgBlob })
+  if (pngBlob) attempts.push({ 'image/png': pngBlob })
+
+  for (const types of attempts) {
+    try {
+      await navigator.clipboard.write([new ClipboardItemCtor(types)])
+      return {
+        regions: built.regions,
+        shapes: built.shapes,
+        texts: built.texts,
+        points: built.points,
+        bytes: built.bytes
+      }
+    } catch (e) {
+      console.warn('写入剪贴板失败:', e)
+    }
+  }
+  return false
 }
 
 // ---------- 生命周期 ----------
@@ -822,6 +1362,9 @@ defineExpose({
   resetView: () => zoomToNational(true),
   refresh: applyConfig,
   exportImage,
+  exportSVG,
+  copyToClipboard,
+  getExportRegions,
   sortByPosition
 })
 </script>

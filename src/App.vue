@@ -66,7 +66,30 @@
           表格管理
         </button>
         <button class="ghost" title="为所有带标注的区域随机分配协调色" @click="randomizeColors">随机配色</button>
-        <button class="ghost export" @click="onExport">导出图片</button>
+        <div ref="exportPicker" class="export-picker">
+          <button
+            class="ghost export"
+            :class="{ on: exportOpen }"
+            title="导出当前视图：PNG 位图 / SVG 矢量图，或直接复制到剪贴板"
+            @click="exportOpen = !exportOpen"
+          >
+            导出<span class="caret">▾</span>
+          </button>
+          <div v-if="exportOpen" class="export-pop">
+            <button type="button" class="export-item" @click="onExportPNG">
+              <span class="export-item-name">导出 PNG</span>
+              <span class="export-item-hint">2 倍分辨率位图</span>
+            </button>
+            <button type="button" class="export-item" @click="openExportDialog">
+              <span class="export-item-name">导出 SVG…</span>
+              <span class="export-item-hint">可选范围 / 立体色块 / 边界简化，PPT 不卡</span>
+            </button>
+            <button type="button" class="export-item" @click="onCopyImage">
+              <span class="export-item-name">复制到剪贴板</span>
+              <span class="export-item-hint">在 PPT 里直接 Ctrl+V 粘贴</span>
+            </button>
+          </div>
+        </div>
         <button class="ghost" @click="resetView">回到全国</button>
         <button class="ghost" @click="reloadConfig">重新加载配置</button>
       </div>
@@ -109,6 +132,17 @@
       @save="onRosterSave"
       @close="rosterOpen = false"
     />
+
+    <ExportDialog
+      v-if="exportDialogOpen"
+      :regions="exportRegions"
+      :selected-adcode="selectedAdcode"
+      :busy="copyBusy"
+      :status="exportStatus"
+      @export="onExportSVGOptions"
+      @copy="onCopySVGOptions"
+      @close="closeExportDialog"
+    />
   </div>
 </template>
 
@@ -117,6 +151,7 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import ChinaMap from './components/ChinaMap.vue'
 import RegionPanel from './components/RegionPanel.vue'
 import RosterManager from './components/RosterManager.vue'
+import ExportDialog from './components/ExportDialog.vue'
 import { useDivisions } from './composables/useDivisions'
 import { shuffledPalette, gradientShades, RANDOM_PALETTE } from './composables/colorPalette'
 import { useTheme } from './composables/useTheme'
@@ -128,12 +163,18 @@ const { themeKey, theme, THEMES } = useTheme()
 const { colorMode, RANDOM_COLOR_MODES } = useColorMode()
 const { displayOptions, DISPLAY_GROUPS } = useDisplayOptions()
 
-// 「显示项」设置弹层：点外部关闭
+// 「显示项」「导出」弹层：点外部关闭
 const displayOpen = ref(false)
 const displayPicker = ref(null)
+const exportOpen = ref(false)
+const exportPicker = ref(null)
 function onDocMouseDown(e) {
-  if (!displayOpen.value) return
-  if (displayPicker.value && !displayPicker.value.contains(e.target)) displayOpen.value = false
+  if (displayOpen.value && displayPicker.value && !displayPicker.value.contains(e.target)) {
+    displayOpen.value = false
+  }
+  if (exportOpen.value && exportPicker.value && !exportPicker.value.contains(e.target)) {
+    exportOpen.value = false
+  }
 }
 
 // 北一区：北京、天津、河北、内蒙古、东三省
@@ -153,6 +194,10 @@ const loading = ref(true)
 const error = ref(null)
 const notice = ref('')
 const rosterOpen = ref(false)
+const exportDialogOpen = ref(false)
+const exportRegions = ref([])
+const copyBusy = ref(false)
+const exportStatus = ref('')
 
 const panelRegion = computed(() =>
   selectedAdcode.value != null ? findDivision(selectedAdcode.value) : null
@@ -255,9 +300,9 @@ function closePanel() {
   selectedAdcode.value = null
 }
 
-function flash(msg) {
+function flash(msg, ms = 1800) {
   notice.value = msg
-  setTimeout(() => (notice.value = ''), 1500)
+  setTimeout(() => (notice.value = ''), ms)
 }
 
 async function onSave(payload) {
@@ -392,12 +437,75 @@ async function randomizeColors() {
   }
 }
 
-function onExport() {
+function onExportPNG() {
+  exportOpen.value = false
   if (map.value && map.value.exportImage(2)) {
     flash('图片已导出（2 倍分辨率 PNG）')
   } else {
     flash('导出失败')
   }
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '0 KB'
+  if (bytes < 1024 * 1024) return Math.max(1, Math.round(bytes / 1024)) + ' KB'
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+}
+
+function exportSummary(stats) {
+  return `${stats.regions} 个区域 · ${stats.shapes} 个形状 · ${formatBytes(stats.bytes)}`
+}
+
+// 打开 SVG 导出设置：范围 / 立体 / 简化 / 背景 / 标签 / 合并
+function openExportDialog() {
+  exportOpen.value = false
+  if (!map.value) return
+  exportRegions.value = map.value.getExportRegions ? map.value.getExportRegions() : []
+  exportStatus.value = ''
+  copyBusy.value = false
+  exportDialogOpen.value = true
+}
+
+function closeExportDialog() {
+  if (copyBusy.value) return
+  exportDialogOpen.value = false
+  exportStatus.value = ''
+}
+
+function onExportSVGOptions(options) {
+  exportDialogOpen.value = false
+  const stats = map.value && map.value.exportSVG(options)
+  if (stats) flash(`SVG 已导出：${exportSummary(stats)}`, 3000)
+  else flash('导出失败')
+}
+
+// 按面板选项复制：复制完成后面板保持打开，方便继续调整或再次复制
+async function onCopySVGOptions(options) {
+  if (!map.value || copyBusy.value) return
+  copyBusy.value = true
+  exportStatus.value = '正在生成并复制…'
+  try {
+    const stats = await map.value.copyToClipboard(options)
+    exportStatus.value = stats
+      ? `已复制：${exportSummary(stats)}，可直接在 PPT 中粘贴`
+      : '当前环境不支持复制，请使用「导出 SVG」'
+  } catch (e) {
+    exportStatus.value = '复制失败：' + (e && e.message ? e.message : '未知错误')
+  } finally {
+    copyBusy.value = false
+  }
+}
+
+// 复制到剪贴板：PPT 支持 SVG 时保持矢量，否则自动回退为 PNG
+async function onCopyImage() {
+  exportOpen.value = false
+  if (!map.value) {
+    flash('导出失败')
+    return
+  }
+  const stats = await map.value.copyToClipboard()
+  if (stats) flash(`已复制：${exportSummary(stats)}，可在 PPT 中粘贴`, 3000)
+  else flash('当前环境不支持复制，请使用「导出 SVG」', 2600)
 }
 
 function resetView() {
@@ -566,6 +674,62 @@ body {
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5), 0 0 14px var(--accent-soft, rgba(0, 229, 255, 0.12));
   box-sizing: border-box;
   white-space: nowrap;
+}
+/* 「导出」下拉菜单 */
+.export-picker {
+  position: relative;
+}
+.export-picker .ghost .caret {
+  margin-left: 5px;
+  font-size: 9px;
+  color: var(--text-dim, #7ea6c4);
+}
+.export-picker .ghost.on {
+  color: var(--accent, #00e5ff);
+  border-color: var(--accent, #00e5ff);
+  background: var(--accent-soft, rgba(0, 229, 255, 0.12));
+}
+.export-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 220px;
+  padding: 6px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border, rgba(0, 229, 255, 0.35));
+  background: var(--panel-bg, rgba(10, 18, 28, 0.96));
+  backdrop-filter: blur(10px);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5), 0 0 14px var(--accent-soft, rgba(0, 229, 255, 0.12));
+  box-sizing: border-box;
+}
+.export-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text, #d6ecff);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.export-item:hover {
+  background: var(--accent-soft, rgba(0, 229, 255, 0.12));
+}
+.export-item-name {
+  font-size: 12px;
+  letter-spacing: 1px;
+}
+.export-item-hint {
+  font-size: 11px;
+  color: var(--text-dim, #7ea6c4);
 }
 .dp-group {
   display: flex;
