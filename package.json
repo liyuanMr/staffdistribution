@@ -2,13 +2,22 @@
   "name": "staffdistribution",
   "version": "0.1.0",
   "private": true,
+  "description": "全国人员分布三维矢量地图",
+  "author": "staffdistribution",
+  "main": "electron/main.js",
   "scripts": {
     "serve": "vue-cli-service serve",
     "build": "vue-cli-service build",
-    "lint": "vue-cli-service lint"
+    "lint": "vue-cli-service lint",
+    "build:exe": "vue-cli-service build && node scripts/build-portable.js",
+    "exe": "node scripts/build-portable.js"
+    
   },
   "dependencies": {
     "core-js": "^3.8.3",
+    "d3-geo": "^3.1.1",
+    "d3-zoom": "^3.0.0",
+    "three": "^0.187.0",
     "vue": "^3.2.13"
   },
   "devDependencies": {
@@ -17,6 +26,8 @@
     "@vue/cli-plugin-babel": "~5.0.0",
     "@vue/cli-plugin-eslint": "~5.0.0",
     "@vue/cli-service": "~5.0.0",
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0",
     "eslint": "^7.32.0",
     "eslint-plugin-vue": "^8.0.3"
   },
@@ -31,6 +42,12 @@
     ],
     "parserOptions": {
       "parser": "@babel/eslint-parser"
+    },
+    "globals": {
+      "defineProps": "readonly",
+      "defineEmits": "readonly",
+      "defineExpose": "readonly",
+      "withDefaults": "readonly"
     },
     "rules": {}
   },

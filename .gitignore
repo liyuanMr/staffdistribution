@@ -1,6 +1,9 @@
 .DS_Store
 node_modules
 /dist
+/build
+/release
+map.pptx
 
 
 # local env files

@@ -1,0 +1,103 @@
+{
+  "110000": {
+    "color": "#adb2df",
+    "display": "label",
+    "headcount": 2,
+    "positions": [
+      {
+        "name": "总代理",
+        "count": 1
+      },
+      {
+        "name": "二级代理",
+        "count": 1
+      },
+      {
+        "name": "三级代理",
+        "count": 1
+      }
+    ],
+    "roster": [
+      {
+        "name": "李xx",
+        "position": "总代理",
+        "phone": "131xxxxx",
+        "note": "负责的医生有xxxxxxxxx",
+        "city": "110114",
+        "hospitals": [
+          {
+            "name": "北大国际",
+            "city": "110114"
+          },
+          {
+            "name": "海淀医院",
+            "city": "110108"
+          },
+          {
+            "name": "昌平医院",
+            "city": ""
+          },
+          {
+            "name": "潞河医院",
+            "city": ""
+          },
+          {
+            "name": "301医院",
+            "city": ""
+          },
+          {
+            "name": "协和医院",
+            "city": ""
+          },
+          {
+            "name": "西城医院",
+            "city": ""
+          }
+        ]
+      },
+      {
+        "name": "李xxx",
+        "position": "总代理",
+        "phone": "131",
+        "note": "",
+        "city": "110108",
+        "hospitals": [
+          {
+            "name": "协和医院",
+            "city": "110108"
+          }
+        ]
+      }
+    ]
+  },
+  "110114": {
+    "color": "#8b90c2",
+    "display": "label",
+    "headcount": 1,
+    "roster": [
+      {
+        "name": "胡xxx",
+        "position": "代表",
+        "phone": "131xxxxx",
+        "note": "积水潭",
+        "city": ""
+      }
+    ]
+  },
+  "150000": {
+    "color": "#cfd3fc",
+    "display": "label",
+    "headcount": 2,
+    "roster": []
+  },
+  "632200": {
+    "color": "#696fa5",
+    "display": "label",
+    "roster": []
+  },
+  "632700": {
+    "color": "#474d88",
+    "display": "label",
+    "roster": []
+  }
+}
